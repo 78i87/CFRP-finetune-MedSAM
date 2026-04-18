@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfrp_medsam2"
+version = "0.1.0"
+description = "MedSAM2 PEFT adaptation for CFRP / CMC XCT fibre segmentation."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "scikit-image>=0.22",
+    "tifffile>=2024.1.30",
+    "einops>=0.7",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "requests>=2.31",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

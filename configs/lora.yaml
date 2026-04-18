@@ -1,0 +1,29 @@
+regime: lora
+model:
+  backend: auto
+  sam2_config: configs/sam2.1_hiera_t512.yaml
+  checkpoint: checkpoints/MedSAM2_latest.pt
+  image_size: 512
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  target_substrings: [qkv, q_proj, k_proj, v_proj, out_proj, proj]
+  exclude_substrings: [mask_decoder.iou_prediction_head]
+  use_conv: false
+  train_mask_decoder: true
+  include_memory_attention: true
+train_volumes:
+  - data/processed/cfrp/train_00.npz
+  - data/processed/cfrp/train_01.npz
+val_volumes:
+  - data/processed/cfrp/val_00.npz
+image_size: 512
+batch_size: 2
+epochs: 20
+lr: 1.0e-4
+weight_decay: 1.0e-4
+grad_clip: 1.0
+prompt_mode: mixed
+ckpt_dir: checkpoints
+log_path: logs/lora.csv

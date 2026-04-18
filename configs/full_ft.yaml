@@ -1,0 +1,20 @@
+regime: full_ft
+model:
+  backend: auto
+  sam2_config: configs/sam2.1_hiera_t512.yaml
+  checkpoint: checkpoints/MedSAM2_latest.pt
+  image_size: 512
+train_volumes:
+  - data/processed/cfrp/train_00.npz
+  - data/processed/cfrp/train_01.npz
+val_volumes:
+  - data/processed/cfrp/val_00.npz
+image_size: 512
+batch_size: 1
+epochs: 10
+full_ft_lr: 1.0e-5
+weight_decay: 1.0e-4
+grad_clip: 1.0
+prompt_mode: bbox
+ckpt_dir: checkpoints
+log_path: logs/full_ft.csv
