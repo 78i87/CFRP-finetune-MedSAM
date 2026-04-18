@@ -50,9 +50,9 @@ def base_cfg(repo: Path, regime: str, epochs: int) -> TrainConfig:
         # samples per epoch so training finishes in minutes, not hours.
         per_component=True,
         target_classes=(1, 2, 3),
-        min_component_voxels=500,
-        max_train_samples=1200,
-        max_val_samples=300,
+        min_component_voxels=1500,
+        max_train_samples=600,
+        max_val_samples=200,
     )
 
 

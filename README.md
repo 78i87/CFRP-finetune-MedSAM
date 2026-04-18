@@ -11,27 +11,56 @@ segmenters trained on medical data need domain adaptation.
 
 ## What this repo does
 
-Runs a **PEFT ablation ladder** against the same data:
+Runs a **PEFT ablation ladder** against the same data. Two task
+variants are reported:
 
-| Regime            | Trainable | LoRA-only params | 3D Dice | Fibre continuity |
-|-------------------|-----------|------------------|---------|------------------|
-| Zero-shot MedSAM2 | —         | 0                | **0.092** | 0.20* |
-| LoRA              | 8.8%      | 450 K            | **0.657** | 0.14  |
-| Conv-LoRA         | 8.8%      | 456 K            | **0.664** | 0.15  |
-| Full fine-tune    | 100%      | 0                | **0.680** | 0.16  |
+### Real CFRP, per-yarn segmentation (hand-labelled, Zenodo 14891845)
 
-(Measured on a 48 x 256 x 256 synthetic-CFRP val volume, 5 epochs, SAM2.1-tiny
-backbone, RTX 4090. Trainable % includes the mask decoder, which is unfrozen
-in the LoRA regimes. The LoRA adapters themselves are ~1.1% of total params.)
+A 512 x 512 x 512 layer-to-layer angle-interlock CFRP volume with 4-class
+hand segmentation (matrix + 3 yarn directions). Each sample is a **single
+yarn tow** with its own tight bbox prompt — matches how a user would
+actually prompt MedSAM2, and is genuinely hard because the yarn/matrix
+X-ray contrast is minimal.
+
+| Regime            | Trainable | Per-yarn Dice (mean ± σ) | Median |
+|-------------------|-----------|--------------------------|--------|
+| Zero-shot MedSAM2 | —         | **0.38 ± 0.13**          | 0.36   |
+| LoRA              | 8.8%      | **0.72 ± 0.24**          | 0.83   |
+| Conv-LoRA         | 8.8%      | **0.71 ± 0.25**          | 0.83   |
+| Full fine-tune    | 100%      | **0.73 ± 0.25**          | 0.85   |
+
+### Synthetic CFRP-ish toy volume (for smoke tests)
+
+Our in-repo synthetic generator (`cfrp_medsam2.synthetic`) packs fibres
+with ~8%-contrast matrix intensity into a 48 x 256 x 256 volume. Used for
+CI and for smoke-testing without the 750 MB Zenodo download.
+
+| Regime            | Trainable | 3D Dice | Fibre continuity |
+|-------------------|-----------|---------|------------------|
+| Zero-shot MedSAM2 | —         | 0.092   | 0.20* |
+| LoRA              | 8.8%      | 0.657   | 0.14  |
+| Conv-LoRA         | 8.8%      | 0.664   | 0.15  |
+| Full fine-tune    | 100%      | 0.680   | 0.16  |
 
 `*` Zero-shot's high continuity is artifactual: it predicts one giant blob
 covering everything, so the "connected component" is long but useless.
 Dice reveals this.
 
-**Bottom line:** Conv-LoRA edges vanilla LoRA on both Dice and fibre
-continuity, and closes ~75% of the gap to full fine-tune at ~9% trainable
-param cost. Delivered as notebooks (`01_`…`07_`) with a small shared
-Python package in `src/cfrp_medsam2`.
+**Bottom line:** on real hand-labelled CFRP, LoRA and Conv-LoRA reach
+median 0.83 Dice on per-yarn segmentation — about 98% of the full
+fine-tune ceiling — at 8.8% of the trainable parameters (LoRA itself is
+~1.1%; the other 7.7% is the unfrozen mask decoder).
+
+Conv-LoRA's edge over vanilla LoRA is small on this particular weave
+(LoRA slightly wins on mean Dice, Conv-LoRA ties on median). That's
+honest: the Conv-LoRA paper's claim is that local spatial priors help
+**when the backbone lacks them**, but the Hiera backbone MedSAM2 uses is
+already hierarchical — the marginal benefit of an extra 3x3 conv in the
+LoRA down-projection is small. On the plain-ViT SAM-v1 the paper benchmarked,
+the gap is larger.
+
+Delivered as notebooks (`01_`…`07_`) with a small shared Python package in
+`src/cfrp_medsam2`.
 
 ## Datasets
 
@@ -82,13 +111,23 @@ bash scripts/setup_medsam2.sh     # clones upstream + downloads checkpoint
 # End-to-end smoke test on fallback model + tiny toy data (no downloads)
 python -m cfrp_medsam2.smoke_test
 
-# The full pipeline on synthetic-CFRP val data:
+# The synthetic-CFRP pipeline (no downloads):
 python scripts/run_zeroshot.py
 python scripts/run_training.py lora --epochs 5
 python scripts/run_training.py conv_lora --epochs 5
 python scripts/run_training.py full_ft --epochs 5
 python scripts/run_ablation.py
 python scripts/generate_figures.py
+
+# The real hand-labelled CFRP pipeline (~750 MB Zenodo download):
+python -c "from cfrp_medsam2.download import download_cfrp_labelled; download_cfrp_labelled('data/raw/cfrp_labelled')"
+python scripts/preprocess_real_cfrp.py
+python scripts/run_zeroshot_real.py
+python scripts/run_training_real.py lora --epochs 3
+python scripts/run_training_real.py conv_lora --epochs 3
+python scripts/run_training_real.py full_ft --epochs 3
+python scripts/run_ablation_real.py
+python scripts/generate_figures_real.py
 
 # Notebook-driven workflow
 jupyter lab notebooks/
