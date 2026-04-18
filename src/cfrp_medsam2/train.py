@@ -55,6 +55,13 @@ class TrainConfig:
     # dataset has tens of thousands of samples).
     max_train_samples: int | None = None
     max_val_samples: int | None = None
+    # If true, write a checkpoint at the end of every epoch in addition to
+    # the best-so-far. Useful for debugging overfitting and for resuming runs.
+    save_every_epoch: bool = False
+    # Optional TensorBoard log directory. If None (default) no TB writer is
+    # created; if set but `torch.utils.tensorboard` can't be imported, we
+    # print a warning and carry on.
+    tensorboard_dir: str | None = None
 
 
 def dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -207,6 +214,33 @@ def train(cfg: TrainConfig) -> dict[str, object]:
 
     train_loader, val_loader = _build_loaders(cfg)
 
+    tb_writer = None
+    if cfg.tensorboard_dir is not None:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            Path(cfg.tensorboard_dir).mkdir(parents=True, exist_ok=True)
+            tb_writer = SummaryWriter(log_dir=cfg.tensorboard_dir)
+        except Exception as e:
+            print(f"[train] tensorboard unavailable ({e.__class__.__name__}: {e}); skipping TB logging.")
+
+    log_stem = Path(cfg.log_path).stem
+    suffix = log_stem[len(cfg.regime):].strip("_") or "toy"
+
+    def _save_ckpt(path: Path, epoch: int, va_dice: float) -> None:
+        torch.save(
+            {
+                "state_dict": {
+                    n: p.detach().cpu()
+                    for n, p in model.state_dict().items()
+                    if cfg.regime == "full_ft" or ("lora_" in n or "mask_decoder" in n)
+                },
+                "cfg": asdict(cfg),
+                "epoch": epoch,
+                "val_dice": va_dice,
+            },
+            path,
+        )
+
     best_val = -1.0
     log_rows: list[dict] = []
     with open(log_path, "w", newline="") as f:
@@ -251,30 +285,28 @@ def train(cfg: TrainConfig) -> dict[str, object]:
                 "time_s": dt,
             }
             writer.writerow(row)
+            f.flush()
             log_rows.append(row)
             print(
                 f"[{cfg.regime}] epoch {epoch:02d}  train_loss={tr_loss:.4f}  "
                 f"train_dice={tr_dice:.4f}  val_dice={va_dice:.4f}  ({dt:.1f}s)"
             )
 
+            if tb_writer is not None:
+                tb_writer.add_scalar("loss/train", tr_loss, epoch)
+                tb_writer.add_scalar("dice/train", tr_dice, epoch)
+                tb_writer.add_scalar("dice/val", va_dice, epoch)
+                tb_writer.add_scalar("lr", optim.param_groups[0]["lr"], epoch)
+
             if va_dice > best_val:
                 best_val = va_dice
-                # Derive a checkpoint suffix from the log path so different
-                # datasets can write to different files side-by-side.
-                log_stem = Path(cfg.log_path).stem
-                suffix = log_stem[len(cfg.regime):].strip("_") or "toy"
-                ckpt_path = ckpt_dir / f"{cfg.regime}_{suffix}_best.pt"
-                save_payload = {
-                    "state_dict": {
-                        n: p.detach().cpu()
-                        for n, p in model.state_dict().items()
-                        if cfg.regime == "full_ft" or ("lora_" in n or "mask_decoder" in n)
-                    },
-                    "cfg": asdict(cfg),
-                    "epoch": epoch,
-                    "val_dice": va_dice,
-                }
-                torch.save(save_payload, ckpt_path)
+                _save_ckpt(ckpt_dir / f"{cfg.regime}_{suffix}_best.pt", epoch, va_dice)
+
+            if cfg.save_every_epoch:
+                _save_ckpt(ckpt_dir / f"{cfg.regime}_{suffix}_epoch{epoch:02d}.pt", epoch, va_dice)
+
+    if tb_writer is not None:
+        tb_writer.close()
 
     return {"regime": cfg.regime, "best_val_dice": best_val, "log": log_rows}
 

@@ -22,12 +22,118 @@ yarn tow** with its own tight bbox prompt — matches how a user would
 actually prompt MedSAM2, and is genuinely hard because the yarn/matrix
 X-ray contrast is minimal.
 
+Tiny backbone, 3 epochs (original pipeline):
+
 | Regime            | Trainable | Per-yarn Dice (mean ± σ) | Median |
 |-------------------|-----------|--------------------------|--------|
 | Zero-shot MedSAM2 | —         | **0.38 ± 0.13**          | 0.36   |
 | LoRA              | 8.8%      | **0.72 ± 0.24**          | 0.83   |
 | Conv-LoRA         | 8.8%      | **0.71 ± 0.25**          | 0.83   |
 | Full fine-tune    | 100%      | **0.73 ± 0.25**          | 0.85   |
+
+**Base+ backbone, 10 epochs** (Tier A upgrade — `run_training_real.py lora
+--backbone base_plus --epochs 10`). Evaluated on the held-out Chalmers
+`test_00.npz` split by `scripts/run_cross_eval.py`:
+
+| Regime            | Trainable | Per-yarn Dice (mean ± σ) | Median |
+|-------------------|-----------|--------------------------|--------|
+| LoRA (base+)      | 4.6%      | **0.786 ± 0.232**        | **0.890** |
+| Conv-LoRA (base+) | 4.6%      | **0.787 ± 0.228**        | **0.890** |
+
+Median per-yarn Dice is now 0.89, up from 0.83 on tiny+3ep. Mean improves
+by 6.6 points. LoRA and Conv-LoRA stay within noise of each other,
+consistent with the original observation that Conv-LoRA's 3x3 conv prior
+adds little on top of the already-hierarchical Hiera backbone.
+
+### Zero-shot baselines across backbones and datasets
+
+Per-component slicewise Dice, 200 samples per dataset, one tight bbox
+prompt per connected fibre component. No adapters, no fine-tuning - just
+the pretrained SAM2.1 / MedSAM2 backbone at 512x512:
+
+| Backbone                                | Chalmers val | Chalmers test | TU Delft ROI 1 | TU Delft ROI 2 |
+|-----------------------------------------|--------------|---------------|----------------|----------------|
+| SAM2.1 tiny (`sam2.1_hiera_tiny.pt`)    | 0.38 / 0.36  | 0.38 / 0.35   | 0.38 / 0.38    | **0.50** / 0.52 |
+| MedSAM2_latest (medical FT of tiny)     | **0.06** / 0.05 | 0.06 / 0.05 | 0.05 / 0.01    | 0.17 / 0.11    |
+| SAM2.1 base+ (`sam2.1_hiera_base_plus.pt`) | 0.38 / 0.41 | 0.38 / 0.42 | 0.32 / 0.35    | 0.46 / 0.48    |
+
+Three things are worth flagging:
+
+1. **MedSAM2's medical fine-tune actively hurts CFRP**. Plain SAM2.1
+   tiny gives ~0.38 Dice zero-shot; the `MedSAM2_latest.pt` weight (a
+   tiny backbone fine-tuned on medical 3D imagery) collapses to ~0.06
+   on the exact same task. Medical-domain priors do not transfer to
+   non-medical XCT fibre segmentation. The "Zero-shot MedSAM2 0.38"
+   number in earlier versions of this README was silently coming from
+   `sam2.1_hiera_tiny.pt`, not from any MedSAM2 weight.
+
+2. **Base+ zero-shot is not meaningfully stronger than tiny zero-shot
+   on Chalmers** (0.38 vs 0.38 mean; median is +5pt better on base+).
+   The Tier A gain (~+7 points mean Dice after LoRA on base+) is almost
+   entirely from the LoRA adaptation, not from the backbone swap.
+
+3. **On TU Delft ROI 2, zero-shot tiny (0.50) beats both the Chalmers-
+   adapted LoRA (0.47) and Conv-LoRA (0.42).** The adapter actually
+   degrades cross-domain performance on that ROI relative to the
+   un-adapted backbone - a stronger "LoRA memorizes Chalmers" signal
+   than the raw -35pt drop alone conveys.
+
+### Cross-dataset generalization (Tier B) — trained Chalmers -> evaluated TU Delft
+
+The Chalmers-trained base+ LoRA checkpoints evaluated on the TU Delft
+thermoplastic CFRP tape dataset (Boos et al. 2025,
+[4TU DOI 10.4121/3a864c60-3023-45ab-a6c6-f36a23d67f56](https://doi.org/10.4121/3a864c60-3023-45ab-a6c6-f36a23d67f56.v1),
+2.0 µm voxel, ROIs 1 and 2, fibre/matrix binary). Different scanner
+(Zeiss Xradia 520 Versa), different weave (unidirectional tape vs
+angle-interlock 3D weave), different label protocol (Trainable Weka
+Segmentation vs hand segmentation). Per-component slicewise Dice, one
+prompt per connected fibre component:
+
+| Regime                        | Chalmers test (in-domain) | TU Delft ROI 1 | TU Delft ROI 2 |
+|-------------------------------|---------------------------|----------------|----------------|
+| Zero-shot SAM2.1 tiny         | 0.383 / 0.346             | 0.377 / 0.379  | **0.497 / 0.520** |
+| Zero-shot SAM2.1 base+        | 0.385 / 0.424             | 0.319 / 0.347  | 0.460 / 0.482  |
+| LoRA (base+, Chalmers-trained) | **0.786 / 0.890**        | **0.393 / 0.401** | 0.466 / 0.473  |
+| Conv-LoRA (base+, Chalmers)   | **0.787 / 0.890**        | 0.367 / 0.373  | 0.422 / 0.438  |
+
+**Finding:** The PEFT adapters do not transfer across scan protocols.
+LoRA and Conv-LoRA both collapse from ~0.79 in-domain to ~0.4 out-of-
+domain on the same task (fibre vs matrix), despite base+ giving a strong
+starting point. Conv-LoRA does *not* close the gap - the extra local
+spatial prior the Conv-LoRA paper claims helps here is either not
+enough of a lever, or is itself over-fitting to Chalmers.
+
+Two particularly sharp signals in the table above:
+
+- On **TU Delft ROI 2**, the un-adapted SAM2.1 tiny backbone (0.50) beats
+  the Chalmers-trained LoRA (0.47) and Conv-LoRA (0.42). The adapter is
+  actively *worse* than doing nothing for that scan.
+- **Conv-LoRA is strictly worse than LoRA on both TU Delft ROIs**,
+  despite being tied on Chalmers. The extra 3x3 conv makes the adapter
+  more Chalmers-specific, not more generalizable.
+
+The in-domain numbers also land essentially tied between LoRA and
+Conv-LoRA, reinforcing the original README's observation that Hiera's
+hierarchical attention already provides most of the inductive bias.
+
+### Volumetric SAM2 memory propagation (Tier B 2A)
+
+`SegModel.infer_volume` now actually drives `SAM2VideoPredictor.init_state`
++ `propagate_in_video` (previously it silently fell back to slicewise).
+Evaluated on Chalmers `test_00.npz` (96 slices) with one mid-slice union
+bbox covering all yarn classes:
+
+| Regime            | 3D Dice | Fibre continuity |
+|-------------------|---------|------------------|
+| LoRA (base+)      | 0.364   | 0.091            |
+| Conv-LoRA (base+) | 0.386   | 0.089            |
+
+Single-prompt volumetric Dice is much lower than per-yarn slicewise
+because the adapter was trained on per-component prompts (one tight bbox
+per yarn tow), not the yarn-union bbox used here. The fibre-continuity
+ratio of ~0.09 shows the prediction is highly fragmented along Z - the
+expected failure mode of a model adapted only on single-slice
+supervision without temporal consistency loss.
 
 ### Synthetic CFRP-ish toy volume (for smoke tests)
 
@@ -103,10 +209,10 @@ cfrp-medsam2/
 ## Quick start
 
 ```bash
-source /venv/main/bin/activate    # provides torch 2.10 + CUDA
+source /venv/main/bin/activate    # provides torch 2.11 + CUDA (Python 3.14)
 pip install -e .
 pip install -r requirements.txt
-bash scripts/setup_medsam2.sh     # clones upstream + downloads checkpoint
+bash scripts/setup_medsam2.sh     # clones upstream + fetches tiny + base+ + MedSAM2_latest
 
 # End-to-end smoke test on fallback model + tiny toy data (no downloads)
 python -m cfrp_medsam2.smoke_test
@@ -123,11 +229,26 @@ python scripts/generate_figures.py
 python -c "from cfrp_medsam2.download import download_cfrp_labelled; download_cfrp_labelled('data/raw/cfrp_labelled')"
 python scripts/preprocess_real_cfrp.py
 python scripts/run_zeroshot_real.py
-python scripts/run_training_real.py lora --epochs 3
-python scripts/run_training_real.py conv_lora --epochs 3
+python scripts/run_training_real.py lora --backbone base_plus --epochs 10 --save-every-epoch
+python scripts/run_training_real.py conv_lora --backbone base_plus --epochs 10 --save-every-epoch
 python scripts/run_training_real.py full_ft --epochs 3
 python scripts/run_ablation_real.py
 python scripts/generate_figures_real.py
+
+# Cross-dataset generalization (Chalmers -> TU Delft, ~15 GB 4TU download):
+python -c "from cfrp_medsam2.download import download_tudelft_cfrp; download_tudelft_cfrp('data/raw/tudelft', parts=('cropped', 'readme'))"
+unzip -o -j data/raw/tudelft/XrayCT_Cropped_and_Registered_Reconstructed.zip \
+    'Cropped_and_Registered Reconstructed/*/[1-4]_2.0um_CRR.tif' \
+    'Cropped_and_Registered Reconstructed/*/[1-4]_2.0um_CRR_TWS_F.tif' \
+    -d data/raw/tudelft/extracted/
+python -c "from cfrp_medsam2.preprocess import ingest_tiff_stack; from pathlib import Path
+for i in [1, 2]:  # ROIs 3/4 ship grayscale probability maps, not binary labels
+    ingest_tiff_stack(f'data/raw/tudelft/extracted/{i}_2.0um_CRR.tif',
+                      f'data/raw/tudelft/extracted/{i}_2.0um_CRR_TWS_F.tif',
+                      f'data/processed/tudelft/roi{i}_2p0um.npz',
+                      label_lut={0: 0, 255: 1}, resize=512)"
+python scripts/run_cross_eval.py checkpoints/lora_real_base_plus_best.pt --backbone base_plus --skip-volumetric
+python scripts/run_cross_eval.py checkpoints/conv_lora_real_base_plus_best.pt --backbone base_plus --skip-volumetric
 
 # Notebook-driven workflow
 jupyter lab notebooks/
@@ -136,29 +257,41 @@ jupyter lab notebooks/
 ## Unit tests
 
 ```bash
-python -m pytest tests           # 19 tests, includes real-MedSAM2 injection
+python -m pytest tests           # 22 tests, includes real-MedSAM2 injection and infer_volume contract
 ```
 
 ## Hardware
 
-Developed against a single 24 GB GPU (RTX 4090). Gradient checkpointing makes
-LoRA/Conv-LoRA fit with batch = 2 volumes x 8 slices at 512x512.
+Developed against a single 32 GB GPU (RTX 5090, Blackwell, sm_120; earlier
+iterations on a 4090). Base+ at 512x512 with batch = 1 uses ~2 GB VRAM during
+LoRA training, so there's plenty of room to push batch size or move to 1024
+resolution once the dataset grows. Storage-wise the pipeline is built to run
+from a large scratch disk (`/workspace` in the development container) because
+the TU Delft ROI subset alone is ~15 GB zipped / 46 GB extracted.
 
 ## Key files
 
 - `src/cfrp_medsam2/lora.py` — `LoRALinear` / Conv-LoRA modules and
   `inject_lora` walker (validated against MedSAM2's Hiera + memory attention).
-- `src/cfrp_medsam2/model.py` — `SegModel` wrapper exposing a single
-  `forward_slice(images, boxes=…, points=…)` method; `forward_slice` and the
-  low-level `forward_image` / `_prepare_backbone_features` /
-  `sam_mask_decoder` chain are differentiable so LoRA grads flow.
+- `src/cfrp_medsam2/model.py` — `SegModel` wrapper exposing
+  `forward_slice(images, boxes=…, points=…)` for differentiable training
+  and `infer_volume(volume, mid_box)` for true SAM2 memory propagation
+  (writes JPEG frames to `/workspace/tmp/`, calls `init_state` +
+  `add_new_points_or_box` + forward/reverse `propagate_in_video`).
 - `src/cfrp_medsam2/train.py` — shared trainer with Dice + 0.5·Focal loss,
-  AdamW + cosine schedule, per-epoch CSV logging.
+  AdamW + cosine schedule, per-epoch CSV logging (flushed row-by-row),
+  optional `save_every_epoch` checkpoints and optional TensorBoard writer.
 - `src/cfrp_medsam2/eval.py` — 2D/3D Dice plus **fibre continuity** metric
   (mean Z-axis extent of connected components relative to GT).
 - `src/cfrp_medsam2/synthetic.py` — toy fibre-in-matrix XCT volumes that
   mimic the ~8%-contrast CFRP problem so the pipeline is runnable without
   multi-GB downloads.
+- `scripts/run_cross_eval.py` — loads a LoRA / Conv-LoRA checkpoint, runs
+  per-component slicewise Dice and optional volumetric propagation Dice
+  on any NPZ under `data/processed/cfrp_real/` and `data/processed/tudelft/`.
+- `configs/sam2.1_hiera_b+_512.yaml` — base+ Hiera config clamped to 512x512
+  input. Installed into the cloned MedSAM2's hydra search path by
+  `scripts/setup_medsam2.sh`.
 
 ## Extending to real CFRP / SiC-SiC data
 

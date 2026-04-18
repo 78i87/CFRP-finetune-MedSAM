@@ -120,6 +120,72 @@ def _download_zenodo(
 
 
 # ---------------------------------------------------------------------------
+# 4TU.ResearchData — TU Delft / Leibniz thermoplastic CFRP tape (Boos et al. 2025)
+# DOI: 10.4121/3a864c60-3023-45ab-a6c6-f36a23d67f56.v1
+# Full record is ~122 GB; the segmented (fibre/matrix/pore) ROIs live in
+# XrayCT_Cropped_and_Registered_Reconstructed.zip (~15 GB).
+# ---------------------------------------------------------------------------
+
+TUDELFT_CFRP_RECORD = "3a864c60-3023-45ab-a6c6-f36a23d67f56"
+
+# Per-file download URLs resolved once via
+#   curl https://data.4tu.nl/v2/articles/<record>/files
+# The file UUIDs are stable for a published record version, so we pin them
+# here to avoid an API roundtrip on every run.
+TUDELFT_CFRP_FILES: dict[str, dict] = {
+    "cropped": {
+        "name": "XrayCT_Cropped_and_Registered_Reconstructed.zip",
+        "size": 15_121_013_685,
+        "url": "https://data.4tu.nl/file/3a864c60-3023-45ab-a6c6-f36a23d67f56/8e5e0388-36d8-447e-b3b2-e3c969177537",
+    },
+    "reconstructed": {
+        "name": "XrayCT_Reconstructed_Image_Dataset.zip",
+        "size": 106_428_467_165,
+        "url": "https://data.4tu.nl/file/3a864c60-3023-45ab-a6c6-f36a23d67f56/6808d5b0-4801-49aa-b28a-76a3f846bdaf",
+    },
+    "microscopy": {
+        "name": "Microscopy_images.zip",
+        "size": 1_266_383_830,
+        "url": "https://data.4tu.nl/file/3a864c60-3023-45ab-a6c6-f36a23d67f56/e42bb7c5-d18f-422a-befd-80dcd3ce0ff3",
+    },
+    "readme": {
+        "name": "ReadMe.txt",
+        "size": 412,
+        "url": "https://data.4tu.nl/file/3a864c60-3023-45ab-a6c6-f36a23d67f56/1b95f1a3-574a-4c67-8493-3aac4007347f",
+    },
+}
+
+
+def download_tudelft_cfrp(
+    out_dir: str | Path,
+    *,
+    parts: Iterable[str] = ("cropped", "readme"),
+) -> list[Path]:
+    """Download the segmented ROI subset of the TU Delft / Leibniz CFRP tape record.
+
+    ``parts`` picks which named files to pull; valid keys are the entries of
+    :data:`TUDELFT_CFRP_FILES`. The default (``"cropped" + "readme"``) grabs
+    the ~15 GB cropped/registered reconstruction that carries the
+    fibre/matrix/pore segmentations plus the record's README, which is the
+    minimum needed for the Chalmers -> TU Delft cross-dataset eval.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    downloaded: list[Path] = []
+    for key in parts:
+        if key not in TUDELFT_CFRP_FILES:
+            raise KeyError(
+                f"unknown TU Delft CFRP file {key!r}; "
+                f"pick from {sorted(TUDELFT_CFRP_FILES)}"
+            )
+        meta = TUDELFT_CFRP_FILES[key]
+        out_path = out_dir / meta["name"]
+        download_file(meta["url"], out_path)
+        downloaded.append(out_path)
+    return downloaded
+
+
+# ---------------------------------------------------------------------------
 # Argonne ACDC — Badran et al. SiC-SiC CMC
 # https://acdc.alcf.anl.gov/mdf/detail/badran_deeplearning_supplementarymaterial_v1.1
 # ---------------------------------------------------------------------------

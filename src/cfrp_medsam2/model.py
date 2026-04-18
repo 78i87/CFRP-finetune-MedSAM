@@ -9,10 +9,13 @@ smoke test.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -115,7 +118,15 @@ class SegModel(nn.Module):
         self.net = _TinySegHead()
 
     def _build_medsam2(self) -> None:
-        """Instantiate MedSAM2 via the upstream ``build_sam2`` helper."""
+        """Instantiate MedSAM2 via the upstream ``build_sam2_video_predictor`` helper.
+
+        We use the video predictor variant (SAM2VideoPredictor, subclass of
+        SAM2Base) so that :meth:`infer_volume` can call ``init_state`` /
+        ``propagate_in_video``. At training time we still call the lower-level
+        SAM2Base forward methods directly (``forward_image``, etc.), which are
+        inherited unchanged, so LoRA adapters inject into exactly the same
+        modules as before.
+        """
         import sys
 
         repo = self.cfg.medsam2_repo
@@ -126,14 +137,16 @@ class SegModel(nn.Module):
         if repo and repo not in sys.path:
             sys.path.insert(0, repo)
 
-        from sam2.build_sam import build_sam2  # type: ignore  # noqa: E402
+        from sam2.build_sam import build_sam2_video_predictor  # type: ignore  # noqa: E402
 
         ckpt = self.cfg.checkpoint
         if ckpt is None or not Path(ckpt).exists():
             raise FileNotFoundError(
                 f"MedSAM2 checkpoint not found at {ckpt!r}; run scripts/setup_medsam2.sh"
             )
-        self.net = build_sam2(self.cfg.sam2_config, ckpt, device=self.cfg.device)
+        self.net = build_sam2_video_predictor(
+            self.cfg.sam2_config, ckpt, device=self.cfg.device
+        )
 
     # ------------------------------------------------------------------
     # Forward
@@ -224,33 +237,156 @@ class SegModel(nn.Module):
         self,
         volume: torch.Tensor,
         mid_box: torch.Tensor,
+        *,
+        frames_dir: str | Path | None = None,
+        offload_video_to_cpu: bool = True,
     ) -> torch.Tensor:
         """Propagate a middle-slice bbox prompt up and down the volume.
 
-        ``volume``: (Z, 3, H, W) float32 tensor of 3-slice windows.
-        ``mid_box``: (4,) xyxy prompt on the middle slice.
-        Returns a (Z, H, W) float tensor of logits.
+        On the ``medsam2`` backend this now uses the real
+        ``SAM2VideoPredictor.init_state`` + ``propagate_in_video`` memory
+        propagation (previously this stub silently fell back to slicewise
+        inference). Slices are exported as JPEGs into ``frames_dir`` (default:
+        a :class:`tempfile.TemporaryDirectory` under ``/workspace/tmp``); the
+        directory is cleaned up on return unless ``frames_dir`` is provided,
+        in which case the caller owns its lifetime.
+
+        ``volume``: (Z, 3, H, W) float32 tensor of 3-slice windows. The
+        middle channel (index 1) is treated as the canonical slice image.
+        ``mid_box``: (4,) xyxy prompt on the middle slice, in pixel coords
+        of the volume's H x W grid.
+        Returns a (Z, H, W) float tensor of logits (pre-sigmoid).
         """
         Z = volume.shape[0]
         mid = Z // 2
         if self.backend == "fallback":
-            # For the fallback, just call forward slice-by-slice with the same box.
             boxes = [mid_box.to(volume.device)] * Z
-            preds = self.forward_slice(volume.to(volume.device), boxes=boxes)
-            return preds
+            return self.forward_slice(volume.to(volume.device), boxes=boxes)
 
-        # MedSAM2 path: we use the public video predictor API if available.
-        try:  # pragma: no cover - exercised only with upstream installed
-            from sam2.sam2_video_predictor import SAM2VideoPredictor  # type: ignore
-        except Exception as e:
-            raise RuntimeError(f"MedSAM2 video predictor unavailable: {e}") from e
+        return self._propagate_volume_medsam2(
+            volume,
+            mid_box,
+            mid=mid,
+            frames_dir=frames_dir,
+            offload_video_to_cpu=offload_video_to_cpu,
+        )
 
-        # The upstream API expects a directory of frames, which isn't convenient
-        # here; instead fall back to per-slice inference without memory.
-        # For the paper-quality pipeline, users should adapt this to call
-        # `init_state` on a frame dir and `add_new_points_or_box` + `propagate_in_video`.
-        boxes = [mid_box.to(volume.device)] * Z
-        return self.forward_slice(volume.to(volume.device), boxes=boxes)
+    def _propagate_volume_medsam2(
+        self,
+        volume: torch.Tensor,
+        mid_box: torch.Tensor,
+        *,
+        mid: int,
+        frames_dir: str | Path | None,
+        offload_video_to_cpu: bool,
+    ) -> torch.Tensor:
+        """MedSAM2 video-predictor memory propagation.
+
+        Flow:
+          1. Export the middle channel of each (3, H, W) window as a JPEG
+             named ``00000.jpg`` .. ``{Z-1:05d}.jpg`` into a scratch dir.
+          2. ``init_state`` on that dir (SAM2 loader ingests JPEGs).
+          3. ``add_new_points_or_box`` on the mid frame with ``mid_box``.
+          4. Drive ``propagate_in_video`` forward and reverse from ``mid``
+             and stitch per-frame mask logits into a (Z, H, W) tensor.
+        The returned tensor is at the *original* H x W resolution of the
+        input volume (video_res_masks are resized by SAM2 internally).
+        """
+        if self.backend != "medsam2":  # pragma: no cover - guarded by caller
+            raise RuntimeError("_propagate_volume_medsam2 called on non-medsam2 backend")
+
+        try:
+            from PIL import Image  # type: ignore
+        except ImportError as e:  # pragma: no cover - Pillow is a transitive dep
+            raise RuntimeError(
+                "Pillow is required to export JPEG frames for SAM2 memory propagation"
+            ) from e
+
+        Z, C, H, W = volume.shape
+        assert C == 3, f"expected 3-slice windows, got C={C}"
+        # SAM2 JPEG loader also resizes internally; we write at native H x W.
+
+        mid_box_np = mid_box.detach().cpu().numpy().astype(np.float32)
+
+        # Pick scratch location: prefer /workspace/tmp (large disk) over /tmp
+        # which is tmpfs-backed on the training containers.
+        managed_tmp = None
+        if frames_dir is None:
+            parent = Path("/workspace/tmp")
+            parent.mkdir(parents=True, exist_ok=True)
+            managed_tmp = tempfile.TemporaryDirectory(
+                prefix="cfrp_sam2_frames_", dir=str(parent)
+            )
+            frames_path = Path(managed_tmp.name)
+        else:
+            frames_path = Path(frames_dir)
+            frames_path.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # 1. Export middle channel (index 1) of each 3-slice window as a
+            #    uint8 RGB JPEG. Volume pixels are expected in [0, 255] u8 or
+            #    float32 in [0, 1]; we clip to be safe.
+            mid_channel = volume[:, 1].detach().cpu().numpy()
+            if mid_channel.dtype != np.uint8:
+                max_val = float(mid_channel.max()) if mid_channel.size else 1.0
+                if max_val <= 1.0 + 1e-6:
+                    mid_channel = (mid_channel * 255.0).clip(0, 255).astype(np.uint8)
+                else:
+                    mid_channel = mid_channel.clip(0, 255).astype(np.uint8)
+            for z in range(Z):
+                rgb = np.stack([mid_channel[z]] * 3, axis=-1)
+                Image.fromarray(rgb, mode="RGB").save(
+                    frames_path / f"{z:05d}.jpg", quality=95
+                )
+
+            # 2. Init state on the scratch frame dir.
+            inference_state = self.net.init_state(
+                video_path=str(frames_path),
+                offload_video_to_cpu=offload_video_to_cpu,
+            )
+
+            # 3. Add the mid-slice bbox prompt. SAM2 treats box xyxy as pixel
+            #    coords in the original video resolution (H x W here).
+            self.net.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=mid,
+                obj_id=0,
+                box=mid_box_np,
+            )
+
+            # 4. Propagate forward then reverse, collecting per-frame logits.
+            logits = torch.zeros((Z, H, W), dtype=torch.float32, device=volume.device)
+            seen = np.zeros(Z, dtype=bool)
+
+            def _collect(frame_idx: int, video_res_masks: torch.Tensor) -> None:
+                # video_res_masks: (num_objs, 1, H_out, W_out). We asked for
+                # one object, so select index 0.
+                m = video_res_masks[0, 0]
+                if m.shape != (H, W):
+                    m = F.interpolate(
+                        m[None, None], size=(H, W), mode="bilinear", align_corners=False
+                    )[0, 0]
+                logits[frame_idx] = m.to(logits.device).to(logits.dtype)
+                seen[frame_idx] = True
+
+            for frame_idx, _obj_ids, vrm in self.net.propagate_in_video(
+                inference_state, start_frame_idx=mid, reverse=False
+            ):
+                _collect(frame_idx, vrm)
+            for frame_idx, _obj_ids, vrm in self.net.propagate_in_video(
+                inference_state, start_frame_idx=mid, reverse=True
+            ):
+                _collect(frame_idx, vrm)
+
+            if not seen.all():  # pragma: no cover - defensive
+                missing = np.where(~seen)[0].tolist()
+                raise RuntimeError(
+                    f"SAM2 propagation missed frames {missing[:10]}{'...' if len(missing) > 10 else ''}"
+                )
+            return logits
+        finally:
+            if managed_tmp is not None:
+                managed_tmp.cleanup()
 
 
 __all__ = ["SegModel", "ModelConfig"]
