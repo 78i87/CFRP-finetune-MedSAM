@@ -46,6 +46,10 @@ from cfrp_medsam2.model import ModelConfig, SegModel
 
 BACKBONES: dict[str, tuple[str, str]] = {
     "tiny": ("configs/sam2.1_hiera_t512.yaml", "checkpoints/sam2.1_hiera_tiny.pt"),
+    "tiny_medsam2": (
+        "configs/sam2.1_hiera_t512.yaml",
+        "checkpoints/MedSAM2_latest.pt",
+    ),
     "base_plus": (
         "configs/sam2.1_hiera_b+_512.yaml",
         "checkpoints/sam2.1_hiera_base_plus.pt",

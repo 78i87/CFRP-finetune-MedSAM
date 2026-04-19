@@ -35,15 +35,32 @@ Tiny backbone, 3 epochs (original pipeline):
 --backbone base_plus --epochs 10`). Evaluated on the held-out Chalmers
 `test_00.npz` split by `scripts/run_cross_eval.py`:
 
-| Regime            | Trainable | Per-yarn Dice (mean ± σ) | Median |
-|-------------------|-----------|--------------------------|--------|
-| LoRA (base+)      | 4.6%      | **0.786 ± 0.232**        | **0.890** |
-| Conv-LoRA (base+) | 4.6%      | **0.787 ± 0.228**        | **0.890** |
+| Regime                            | Init                   | Trainable | Per-yarn Dice (mean ± σ) | Median |
+|-----------------------------------|------------------------|-----------|--------------------------|--------|
+| LoRA (base+, 10 ep)               | SAM2.1 base+           | 4.6%      | **0.786 ± 0.232**        | **0.890** |
+| Conv-LoRA (base+, 10 ep)          | SAM2.1 base+           | 4.6%      | **0.787 ± 0.228**        | **0.890** |
+| LoRA (tiny, 10 ep)                | MedSAM2_latest (tiny)  | 8.8%      | 0.704 ± 0.223            | 0.805  |
+| Conv-LoRA (tiny, 10 ep)           | MedSAM2_latest (tiny)  | 8.8%      | 0.698 ± 0.222            | 0.786  |
 
-Median per-yarn Dice is now 0.89, up from 0.83 on tiny+3ep. Mean improves
-by 6.6 points. LoRA and Conv-LoRA stay within noise of each other,
-consistent with the original observation that Conv-LoRA's 3x3 conv prior
-adds little on top of the already-hierarchical Hiera backbone.
+Median per-yarn Dice is 0.89 on plain SAM2.1 base+, up from 0.83 on the
+original tiny+3ep. Mean improves by 6.6 points. LoRA and Conv-LoRA stay
+within noise of each other, consistent with the original observation
+that Conv-LoRA's 3x3 conv prior adds little on top of the
+already-hierarchical Hiera backbone.
+
+**Starting LoRA from MedSAM2_latest is strictly worse than starting from
+plain SAM2.1**, even on the same Chalmers data the LoRA is trained on:
+LoRA falls from 0.786 → 0.704 mean (−8 pts) and 0.890 → 0.805 median
+(−9 pts); Conv-LoRA falls by a similar margin. Some of this is the
+smaller backbone (tiny vs base+), but the effect persists when the
+earlier tiny+3ep baseline (also tiny, also started from plain SAM2.1
+tiny, not MedSAM2) hit **0.72 mean / 0.83 median** in just 3 epochs -
+i.e. plain-SAM2.1-tiny LoRA at 3 epochs already beat MedSAM2-init tiny
+LoRA at 10 epochs on median Dice. The medical fine-tune is a worse
+foundation for downstream PEFT adaptation, not just a worse zero-shot
+starting point. Training trajectory: LoRA from MedSAM2 climbs from val
+0.06 zero-shot to 0.74 best (epoch 6), but never catches the 0.78 that
+plain-SAM2.1 base+ LoRA reaches at epoch 8.
 
 ### Zero-shot baselines across backbones and datasets
 
@@ -89,12 +106,15 @@ angle-interlock 3D weave), different label protocol (Trainable Weka
 Segmentation vs hand segmentation). Per-component slicewise Dice, one
 prompt per connected fibre component:
 
-| Regime                        | Chalmers test (in-domain) | TU Delft ROI 1 | TU Delft ROI 2 |
-|-------------------------------|---------------------------|----------------|----------------|
-| Zero-shot SAM2.1 tiny         | 0.383 / 0.346             | 0.377 / 0.379  | **0.497 / 0.520** |
-| Zero-shot SAM2.1 base+        | 0.385 / 0.424             | 0.319 / 0.347  | 0.460 / 0.482  |
-| LoRA (base+, Chalmers-trained) | **0.786 / 0.890**        | **0.393 / 0.401** | 0.466 / 0.473  |
-| Conv-LoRA (base+, Chalmers)   | **0.787 / 0.890**        | 0.367 / 0.373  | 0.422 / 0.438  |
+| Regime                              | Chalmers test (in-domain) | TU Delft ROI 1 | TU Delft ROI 2 |
+|-------------------------------------|---------------------------|----------------|----------------|
+| Zero-shot SAM2.1 tiny               | 0.383 / 0.346             | 0.377 / 0.379  | **0.497 / 0.520** |
+| Zero-shot SAM2.1 base+              | 0.385 / 0.424             | 0.319 / 0.347  | 0.460 / 0.482  |
+| Zero-shot MedSAM2_latest (tiny)     | 0.062 / 0.053             | 0.054 / 0.007  | 0.169 / 0.113  |
+| LoRA (base+, plain-SAM2.1 init)     | **0.786 / 0.890**        | **0.393 / 0.401** | 0.466 / 0.473  |
+| Conv-LoRA (base+, plain-SAM2.1 init) | **0.787 / 0.890**       | 0.367 / 0.373  | 0.422 / 0.438  |
+| LoRA (tiny, MedSAM2_latest init)    | 0.704 / 0.805             | 0.261 / 0.255  | 0.220 / 0.213  |
+| Conv-LoRA (tiny, MedSAM2_latest init) | 0.698 / 0.786           | 0.268 / 0.279  | 0.219 / 0.212  |
 
 **Finding:** The PEFT adapters do not transfer across scan protocols.
 LoRA and Conv-LoRA both collapse from ~0.79 in-domain to ~0.4 out-of-
@@ -103,14 +123,25 @@ starting point. Conv-LoRA does *not* close the gap - the extra local
 spatial prior the Conv-LoRA paper claims helps here is either not
 enough of a lever, or is itself over-fitting to Chalmers.
 
-Two particularly sharp signals in the table above:
+Four particularly sharp signals in the table above:
 
 - On **TU Delft ROI 2**, the un-adapted SAM2.1 tiny backbone (0.50) beats
   the Chalmers-trained LoRA (0.47) and Conv-LoRA (0.42). The adapter is
   actively *worse* than doing nothing for that scan.
-- **Conv-LoRA is strictly worse than LoRA on both TU Delft ROIs**,
-  despite being tied on Chalmers. The extra 3x3 conv makes the adapter
-  more Chalmers-specific, not more generalizable.
+- **Conv-LoRA is strictly worse than LoRA on both TU Delft ROIs** from
+  plain-SAM2.1 init, despite being tied on Chalmers. The extra 3x3 conv
+  makes the adapter more Chalmers-specific, not more generalizable.
+- **MedSAM2_latest-init LoRA halves cross-domain Dice** compared to
+  plain-SAM2.1-init LoRA (ROI 2: 0.22 vs 0.47). Starting from a
+  wrong-domain fine-tune compounds catastrophically: Chalmers adaptation
+  turns the medical features into Chalmers-medical features, which
+  transfer to TU Delft even worse than raw medical features did.
+- **MedSAM2-init LoRA (0.22 on ROI 2) loses to zero-shot plain SAM2.1
+  tiny (0.50 on ROI 2) by 28 points.** The combination of a
+  wrong-domain foundation and Chalmers adaptation produces something
+  strictly worse than doing nothing with the right foundation. If your
+  downstream domain is not medical, plain SAM2.1 is the better base for
+  PEFT, full stop.
 
 The in-domain numbers also land essentially tied between LoRA and
 Conv-LoRA, reinforcing the original README's observation that Hiera's
